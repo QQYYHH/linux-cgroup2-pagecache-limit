@@ -64,6 +64,7 @@
 struct scan_control {
 	/* How many pages shrink_list() should reclaim */
 	unsigned long nr_to_reclaim;
+	int mainly_pagecache;
 
 	/* This context's GFP mask */
 	gfp_t gfp_mask;
@@ -656,8 +657,8 @@ static pageout_t pageout(struct page *page, struct address_space *mapping,
 		return PAGE_KEEP;
 
 	/**
-	 * 检查 address_space是否已经定义
-	 */
+	* 检查 address_space是否已经定义
+	*/
 	if (!mapping) {
 		/*
 		 * Some data journaling orphaned pages can have
@@ -1045,7 +1046,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		page = lru_to_page(page_list);
 		list_del(&page->lru);
 
-		/* 页面被锁住，继续放入 inactive_list中 */
+	/* 页面被锁住，继续放入 inactive_list中 */
 		if (!trylock_page(page))
 			goto keep;
 
@@ -1901,7 +1902,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	/* 将 pagevec 缓冲区中的页 加入 active_list or inactive_list
 	* lru_cache_add 会将 page 首先加入 pagevec，等到积攒一定数量的页面 由某线程统一加入 lru链表
 	*/
-	lru_add_drain(); 
+	lru_add_drain();
 
 	if (!sc->may_unmap)
 		isolate_mode |= ISOLATE_UNMAPPED;
@@ -2521,6 +2522,16 @@ out:
 
 		*lru_pages += size;
 		nr[lru] = scan;
+		/* 如果是file_lru 且 尽可能多回收file，nr取大一点 */
+		/* 尽量不回收匿名页 */
+		if(sc->mainly_pagecache){
+			if(file){
+				nr[lru] = max(nr[lru], min(size, max(SWAP_CLUSTER_MAX, sc->nr_to_reclaim)));
+			}
+			else{ // anno page
+				nr[lru] = 0;
+			}
+		}
 	}
 }
 
@@ -2574,7 +2585,6 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
-		/* 便利 4个LRU 链表 */
 		for_each_evictable_lru(lru) {
 			if (nr[lru]) {
 				nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX);
@@ -3296,6 +3306,13 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		.may_unmap = 1,
 		.may_swap = may_swap,
 	};
+
+	/* 新增 对是否 主要释放 pagecache的判断 */
+	if(nr_pages > 9999999){
+		sc.mainly_pagecache = 1;
+		sc.nr_to_reclaim = max(nr_pages - 9999999, SWAP_CLUSTER_MAX);
+	}
+	else sc.mainly_pagecache = 0;
 
 	/*
 	 * Unlike direct reclaim via alloc_pages(), memcg's reclaim doesn't

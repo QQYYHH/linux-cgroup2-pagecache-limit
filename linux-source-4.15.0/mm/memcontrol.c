@@ -1107,6 +1107,17 @@ static unsigned long mem_cgroup_margin(struct mem_cgroup *memcg)
 	return margin;
 }
 
+static unsigned long pagecache_cgroup_margin(struct mem_cgroup *memcg){
+	unsigned long margin = 0;
+	unsigned long count;
+	unsigned long limit;
+
+	count = page_counter_read(&memcg->pagecache);
+	limit = READ_ONCE(memcg->pagecache.limit);
+	margin = (count < limit)? limit - count: 0;
+	return margin;
+}
+
 /*
  * A routine for checking "mem" is under move_account() or not.
  *
@@ -1743,14 +1754,7 @@ EXPORT_SYMBOL(unlock_page_memcg);
 /*
  * size of first charge trial. "32" comes from vmscan.c's magic value.
  * TODO: maybe necessary to use big numbers in big irons.
- * 每个CPU[per_cpu]都缓存这样一个结构体，里面保存空余的可供分配的页面个数
- * 因为try_charge 每次最少 charge batch 个页
- * 如果当前需要的页面个数nr_pages < batch，那么page_counter -> count会多记录 batch - nr_pages
- * 那么这些多出来的页面就记录在 这个结构体里面
- * try_charge时，首先调用consume_stock，看多出来的页面是否满足
- * 如果满足，直接返回
  */
-
 #define CHARGE_BATCH	32U
 struct memcg_stock_pcp {
 	struct mem_cgroup *cached; /* this never be root cgroup */
@@ -1784,7 +1788,7 @@ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 	if (nr_pages > CHARGE_BATCH)
 		return ret;
 
-	local_irq_save(flags); /* disable irq */
+	local_irq_save(flags);
 
 	stock = this_cpu_ptr(&memcg_stock);
 	if (memcg == stock->cached && stock->nr_pages >= nr_pages) {
@@ -1792,7 +1796,7 @@ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 		ret = true;
 	}
 
-	local_irq_restore(flags); /* enable irq */
+	local_irq_restore(flags);
 
 	return ret;
 }
@@ -1956,10 +1960,26 @@ void mem_cgroup_handle_over_high(void)
 	current->memcg_nr_pages_over_high = 0;
 }
 
+/**
+ * 用于判断 当前统计的页是否属于 page-cache
+ */
+#define QYH_PAGE_CACHE 9999999
+
 static int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
 		      unsigned int nr_pages)
 {
-	/* 每次至少 charge batch 个页（batch = 32） */
+	/* 通过 nr_pages 判断是否属于pagecache */
+	int is_pagecache = 0;
+	if(nr_pages > QYH_PAGE_CACHE){
+		is_pagecache = 1;
+		nr_pages -= QYH_PAGE_CACHE;
+	}
+	/* 新加控制变量 */
+	int pagecache_overflow = -1; // pagecache是否超过限制
+	int mem_overflow = -1; // 总的mem是否超过限制
+	struct mem_cgroup *pagecache_over_limit; // pagecache超过限制的 cgroup
+	unsigned long nr_reclaimed_pagecache; // pagecache回收数量
+	
 	unsigned int batch = max(CHARGE_BATCH, nr_pages);
 	int nr_retries = MEM_CGROUP_RECLAIM_RETRIES;
 	struct mem_cgroup *mem_over_limit;
@@ -1968,38 +1988,80 @@ static int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	bool may_swap = true;
 	bool drained = false;
 
+
 	if (mem_cgroup_is_root(memcg))
 		return 0;
 retry:
 	/**
-	 * 尝试消耗当前CPU缓存的多余页面数量
-	 * 如果可以，直接返回
+	 * 如果当前CPU缓存的多余空闲页够用 <==> 总内存限制满足条件
+	 * 再判断这些页是否属于 pagecache，如果是
+	 * 进一步判断pagecache限制是否达到
 	 */
-	if (consume_stock(memcg, nr_pages))
+	if (consume_stock(memcg, nr_pages)){
+		mem_overflow = -1;
+		if(is_pagecache){
+			goto retry_pagecache;
+		}
 		return 0;
+	}
 
+	/* 这里判断总内存限制条件是否满足 */
 	if (!do_memsw_account() ||
 	    page_counter_try_charge(&memcg->memsw, batch, &counter)) {
-		if (page_counter_try_charge(&memcg->memory, batch, &counter))
-			goto done_restock;
+		if (page_counter_try_charge(&memcg->memory, batch, &counter)){
+			mem_overflow = 0;
+			goto retry_pagecache;
+			// goto done_restock;
+		}
+			
 		if (do_memsw_account())
 			page_counter_uncharge(&memcg->memsw, batch);
 		mem_over_limit = mem_cgroup_from_counter(counter, memory);
+		mem_overflow = 1;
 	} else {
 		mem_over_limit = mem_cgroup_from_counter(counter, memsw);
+		mem_overflow = 1;
 		may_swap = false;
 	}
 
+	/* batch 只针对 memory 或 memsw */
 	if (batch > nr_pages) {
 		batch = nr_pages;
 		goto retry;
 	}
 
+retry_pagecache:
+	/* 这里判断pagecache是否满足限制 */
+	/**
+	 * 当前 charge的不是 pagecache，直接跳出
+	 * pagecache_overflow 初始值是-1，如果charge的是pagecache，则page_counter_try_charge至少执行一次
+	 * 如果执行之后发现满足条件，pagecache_overflow == 0，以后就不用再执行这块代码
+	 */
+	if(is_pagecache && pagecache_overflow != 0){
+		if(!page_counter_try_charge(&memcg->pagecache, nr_pages, &counter)){
+			pagecache_over_limit = mem_cgroup_from_counter(counter, pagecache);
+			pagecache_overflow = 1;
+		}
+		else pagecache_overflow = 0;
+	}
+
+	/* 从 consume_stock 跳转 */
+	if(mem_overflow == -1 && pagecache_overflow != 1) return 0;
+
+	/**
+	 * 没有直接从 consume_stock跳转，说明CPU缓存的多余页面不足
+	 * page_counter_try_charge 成功之后 跳转 restock
+	 * 补充CPU缓存并且 测试是否内存压力达到 high
+	 */ 
+	if(!mem_overflow && pagecache_overflow != 1) goto done_restock;
+
+	// 执行到这里 说明 mem_overflow, pagecache_overflow 至少有一个是1
+	
 	/*
 	 * Memcg doesn't have a dedicated reserve for atomic
 	 * allocations. But like the global atomic pool, we need to
 	 * put the burden of reclaim on regular allocation requests
-	 * and let these go through as privileged allocations.
+	 * and let these go through as privileged allocations. 
 	 */
 	if (gfp_mask & __GFP_ATOMIC)
 		goto force;
@@ -2026,25 +2088,46 @@ retry:
 		goto nomem;
 
 	if (!gfpflags_allow_blocking(gfp_mask))
-		goto nomem;
+		goto nomem;		
+		
 
-	mem_cgroup_event(mem_over_limit, MEMCG_MAX);
-
-	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+	/* 先尝试回收全部页面 */
+	if(mem_overflow == 1){
+		mem_cgroup_event(mem_over_limit, MEMCG_MAX);
+		
+		nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
 						    gfp_mask, may_swap);
+		if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
+			goto retry;
 
-	if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
-		goto retry;
-
-	if (!drained) {
-		/**
-		 * 释放所有CPU缓存 的多出来的页面
-		 * 最终将这些多出来的页面从 page_counter中减掉
-		 */
-		drain_all_stock(mem_over_limit);
-		drained = true;
-		goto retry;
+		if (!drained) {
+			/**
+		 	* 释放所有CPU缓存 的多出来的页面
+		 	* 最终将这些多出来的页面从 page_counter中减掉
+		 	*/
+			drain_all_stock(mem_over_limit);
+			drained = true;
+			goto retry;
+		}
 	}
+	/* 整体回收完毕之后，判断pagecache是否满足条件，如果依旧不满足，再次回收 */
+	int res_pagecache = 0; // 便于记录 pagecache的可用余量
+	if(pagecache_overflow == 1 && (res_pagecache = pagecache_cgroup_margin(pagecache_over_limit)) < nr_pages){
+
+		printk(KERN_ALERT "%s %s %d, ###count: %d, limit: %d", __func__, __FILE__, __LINE__, page_counter_read(&pagecache_over_limit->pagecache), READ_ONCE(pagecache_over_limit->pagecache.limit));
+		// mem_cgroup_event(pagecache_over_limit, MEMCG_MAX);
+		
+		int pagecache_need_to_free = nr_pages - res_pagecache + QYH_PAGE_CACHE; /* 指明这一次以释放pagecache为主 */
+		
+		nr_reclaimed_pagecache = try_to_free_mem_cgroup_pages(pagecache_over_limit, pagecache_need_to_free,
+						    gfp_mask, false);
+		printk(KERN_ALERT "%s %s %d, #####reclaim : %d [page]", __func__, __FILE__, __LINE__, nr_reclaimed_pagecache);
+
+		if(pagecache_cgroup_margin(pagecache_over_limit) >= nr_pages){
+			goto retry_pagecache;
+		}
+	}
+	
 
 	if (gfp_mask & __GFP_NORETRY)
 		goto nomem;
@@ -2057,18 +2140,24 @@ retry:
 	 * unlikely to succeed so close to the limit, and we fall back
 	 * to regular pages anyway in case of failure.
 	 */
-	if (nr_reclaimed && nr_pages <= (1 << PAGE_ALLOC_COSTLY_ORDER))
-		goto retry;
+	if ((nr_reclaimed || nr_reclaimed_pagecache) && nr_pages <= (1 << PAGE_ALLOC_COSTLY_ORDER)){
+		if(mem_overflow == 1) goto retry;
+		goto retry_pagecache;
+	}
 	/*
 	 * At task move, charge accounts can be doubly counted. So, it's
 	 * better to wait until the end of task_move if something is going on.
 	 */
-	/* 将一个task 移动到另一个 cgroup中 */
-	if (mem_cgroup_wait_acct_move(mem_over_limit))
+	if (mem_overflow == 1 && mem_cgroup_wait_acct_move(mem_over_limit)){
+		printk(KERN_ALERT "%s %s %d, moving is executing!!!!", __func__, __FILE__, __LINE__);
 		goto retry;
+	}
+		
 
-	if (nr_retries--)
-		goto retry;
+	if (nr_retries--){
+		if(mem_overflow == 1) goto retry;
+		goto retry_pagecache;
+	}
 
 	if (gfp_mask & __GFP_NOFAIL)
 		goto force;
@@ -2076,10 +2165,15 @@ retry:
 	if (fatal_signal_pending(current))
 		goto force;
 
-	mem_cgroup_event(mem_over_limit, MEMCG_OOM);
+	/* 这里只有 总内存超过限制才发出 OOM */
+	if(mem_overflow == 1){
+		mem_cgroup_event(mem_over_limit, MEMCG_OOM);
 
-	mem_cgroup_oom(mem_over_limit, gfp_mask,
+		mem_cgroup_oom(mem_over_limit, gfp_mask,
 		       get_order(nr_pages * PAGE_SIZE));
+	}
+	// 如果 pagecache依然不满足要求，往下继续执行，强制分配。
+	
 nomem:
 	if (!(gfp_mask & __GFP_NOFAIL))
 		return -ENOMEM;
@@ -2089,9 +2183,14 @@ force:
 	 * being freed very soon.  Allow memory usage go over the limit
 	 * temporarily by force charging it.
 	 */
-	page_counter_charge(&memcg->memory, nr_pages);
-	if (do_memsw_account())
-		page_counter_charge(&memcg->memsw, nr_pages);
+	if(mem_overflow == 1){
+		page_counter_charge(&memcg->memory, nr_pages);
+		if (do_memsw_account())
+			page_counter_charge(&memcg->memsw, nr_pages);
+	}
+	if(pagecache_overflow == 1){
+		page_counter_charge(&memcg->pagecache, nr_pages);
+	}
 	css_get_many(&memcg->css, nr_pages);
 
 	return 0;
@@ -2137,6 +2236,11 @@ static void cancel_charge(struct mem_cgroup *memcg, unsigned int nr_pages)
 	if (mem_cgroup_is_root(memcg))
 		return;
 
+	if(nr_pages > QYH_PAGE_CACHE){ // 说明是pagecache
+		nr_pages -= QYH_PAGE_CACHE;
+		page_counter_uncharge(&memcg->pagecache, nr_pages);
+	}
+	
 	page_counter_uncharge(&memcg->memory, nr_pages);
 	if (do_memsw_account())
 		page_counter_uncharge(&memcg->memsw, nr_pages);
@@ -4364,6 +4468,9 @@ fail:
 	return NULL;
 }
 
+/**
+ * mem_cgroup initialization
+*/
 static struct cgroup_subsys_state * __ref
 mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 {
@@ -4388,12 +4495,16 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 		page_counter_init(&memcg->memsw, &parent->memsw);
 		page_counter_init(&memcg->kmem, &parent->kmem);
 		page_counter_init(&memcg->tcpmem, &parent->tcpmem);
+		/* added by qyh */
+		page_counter_init(&memcg->pagecache, &parent->pagecache);
 	} else {
 		page_counter_init(&memcg->memory, NULL);
 		page_counter_init(&memcg->swap, NULL);
 		page_counter_init(&memcg->memsw, NULL);
 		page_counter_init(&memcg->kmem, NULL);
 		page_counter_init(&memcg->tcpmem, NULL);
+		/* added by qyh */
+		page_counter_init(&memcg->pagecache, NULL);
 		/*
 		 * Deeper hierachy with use_hierarchy == false doesn't make
 		 * much sense so let cgroup subsystem know about this
@@ -4403,6 +4514,9 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 			memory_cgrp_subsys.broken_hierarchy = true;
 	}
 
+	// memcg->pagecache.limit = 10 * 1024 * 1024 / PAGE_SIZE; // 测试，先限制成10M
+	printk(KERN_ALERT "##### css - page-cache init down and pagecache limit is %llu", memcg->pagecache.limit);
+	
 	/* The following stuff does not apply to the root */
 	if (!parent) {
 		root_mem_cgroup = memcg;
@@ -4665,6 +4779,7 @@ static int mem_cgroup_move_account(struct page *page,
 				   struct mem_cgroup *from,
 				   struct mem_cgroup *to)
 {
+	printk(KERN_ALERT "%s %s %d, page is moving from one cgroup to another!!!", __func__, __FILE__, __LINE__);
 	unsigned long flags;
 	unsigned int nr_pages = compound ? hpage_nr_pages(page) : 1;
 	int ret;
@@ -5339,15 +5454,7 @@ static ssize_t memory_max_write(struct kernfs_open_file *of,
 	err = page_counter_memparse(buf, "max", &max);
 	if (err)
 		return err;
-	/**
-	 * xchg(&p, x)
-	 * 将x值放入寄存器，然后寄存器与p所指内容交换，p所指原来的值
-	 * i = 1, j = 2
-	 * xchg(&i, j)
-	 * 返回1, i = 2, j = 2
-	 * 交换操作是原子的
-	 * 相当于原子 将x复制给 p所指单元
-	 */
+
 	xchg(&memcg->memory.limit, max);
 
 	for (;;) {
@@ -5478,6 +5585,67 @@ static int memory_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/**
+ * 写 cgroup.pagecache_limit
+ */ 
+static ssize_t pagecache_limit_write(struct kernfs_open_file *of,
+				char *buf, size_t nbytes, loff_t off)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+	unsigned long limit = 0;
+	unsigned int nr_reclaims = MEM_CGROUP_RECLAIM_RETRIES;
+	int err;
+	
+	buf = strstrip(buf);
+	err = page_counter_memparse(buf, "max", &limit);
+	if(err)
+		return err;
+
+	xchg(&memcg->pagecache.limit, limit);
+
+	/* 如果当前使用量超过限制 就尝试释放内存pagecache */
+	while(1){
+		unsigned long nr_pages = page_counter_read(&memcg->pagecache);
+		if(nr_pages <= limit) break;
+
+		nr_pages += 9999999 - limit;
+		if(!try_to_free_mem_cgroup_pages(memcg, nr_pages, GFP_KERNEL, true)){ // 没有释放pagecache 再次尝试
+			--nr_reclaims;
+			continue;
+		}
+		/* 5次都没成功 就直接推出 */
+		break;
+	}
+
+	return nbytes;
+}
+
+/**
+ * 读 pagecache_limit
+ */
+static int pagecache_limit_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
+	unsigned long limit = READ_ONCE(memcg->pagecache.limit);
+
+	if(limit == PAGE_COUNTER_MAX) seq_puts(m, "max\n");
+	else seq_printf(m, "%llu\n", (u64)limit * PAGE_SIZE);
+
+	return 0;
+}
+
+/**
+ * 读取当前 pagecache 使用量
+ */
+static u64 pagecache_current_read(struct cgroup_subsys_state *css, 
+						struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+
+	return (u64)page_counter_read(&memcg->pagecache) * PAGE_SIZE;
+}
+
+
 static struct cftype memory_files[] = {
 	{
 		.name = "current",
@@ -5513,6 +5681,18 @@ static struct cftype memory_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = memory_stat_show,
 	},
+	/* add new user interface of pagecache */
+	{
+		.name = "pagecache_limit", 
+		.flags = CFTYPE_NOT_ON_ROOT, 
+		.seq_show = pagecache_limit_show, 
+		.write = pagecache_limit_write,
+	}, 
+	{
+		.name = "pagecache_current", 
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = pagecache_current_read,
+	}, 
 	{ }	/* terminate */
 };
 
@@ -5583,6 +5763,7 @@ bool mem_cgroup_low(struct mem_cgroup *root, struct mem_cgroup *memcg)
 	return true;
 }
 
+
 /**
  * mem_cgroup_try_charge - try charging a page
  * @page: page to charge
@@ -5639,6 +5820,13 @@ int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
 	if (!memcg)
 		memcg = get_mem_cgroup_from_mm(mm);
 
+	/**
+	 * 这里判断该page是否属于 page-cache
+	 * mapping != NULL 且 low_bit(mapping) == 0
+	 */
+	if(page->mapping && (((unsigned long)(page->mapping) & 0x1) == 0)){
+		nr_pages += QYH_PAGE_CACHE;
+	}
 	ret = try_charge(memcg, gfp_mask, nr_pages);
 
 	css_put(&memcg->css);
@@ -5685,19 +5873,7 @@ void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
 	commit_charge(page, memcg, lrucare);
 
 	local_irq_disable();
-	/**
-	 * 根据 page的类型 增加 当前cpu 缓存的mem_cgroup_stat_cpu 结构体 相应的资源数
-	 */
 	mem_cgroup_charge_statistics(memcg, page, compound, nr_pages);
-	/**
-	 * 检查一些事件
-	 * 用于通知一些系统本身就有或用户自定义的事件
-	 * 比如用户在memory.event文件接口里按照规定格式 定义一个事件 [用户要首先申请一个eventfd]
-	 * 该事件可通过eventfd文件描述符读取
-	 * eventfd : create a file descriptor for event notification
-	 * 该事件在 内存使用量在超过 threshold时通知用户 [修改eventfd对应的内存数据结构]
-	 * 用户通过读取 eventfd 获取通知
-	 */
 	memcg_check_events(memcg, page);
 	local_irq_enable();
 
@@ -5735,6 +5911,10 @@ void mem_cgroup_cancel_charge(struct page *page, struct mem_cgroup *memcg,
 	if (!memcg)
 		return;
 
+	// 如果属于 pagecache，增加nr_pages
+	if(page->mapping && (((unsigned long)(page->mapping) & 0x1) == 0)){
+		nr_pages += QYH_PAGE_CACHE;
+	}
 	cancel_charge(memcg, nr_pages);
 }
 
@@ -5761,6 +5941,12 @@ static void uncharge_batch(const struct uncharge_gather *ug)
 
 	if (!mem_cgroup_is_root(ug->memcg)) {
 		page_counter_uncharge(&ug->memcg->memory, nr_pages);
+		/* 增加 对 pagecache的资源统计 */
+		if(ug->nr_file > 0){
+			page_counter_uncharge(&ug->memcg->pagecache, ug->nr_file);
+			// printk(KERN_ALERT "%s %s %d, ##### uncharge %d, remain pagecount is %d", __func__, __FILE__, __LINE__, ug->nr_file, page_counter_read(&ug->memcg->pagecache));
+		}
+
 		if (do_memsw_account())
 			page_counter_uncharge(&ug->memcg->memsw, nr_pages);
 		if (!cgroup_subsys_on_dfl(memory_cgrp_subsys) && ug->nr_kmem)
@@ -5795,9 +5981,6 @@ static void uncharge_page(struct page *page, struct uncharge_gather *ug)
 	 * Nobody should be changing or seriously looking at
 	 * page->mem_cgroup at this point, we have fully
 	 * exclusive access to the page.
-	 * 如果 当前memcg 和 page的memcg不一致
-	 * 如果当前memcg存在，则先释放当前memcg，然后清空
-	 * 最后将ug->memcg 设置成 page->mem_cgroup
 	 */
 
 	if (ug->memcg != page->mem_cgroup) {
@@ -5829,8 +6012,12 @@ static void uncharge_page(struct page *page, struct uncharge_gather *ug)
 	}
 
 	ug->dummy_page = page;
-	/* 最后将page 和 内存控制器解除关系 */
 	page->mem_cgroup = NULL;
+
+	/* 判断page->mapping 是否指向 pagecache，如果是，清空 */
+	if(page->mapping && (((unsigned long)(page->mapping) & 0x1) == 0)){
+		page->mapping = NULL;
+	}
 }
 
 static void uncharge_list(struct list_head *page_list)
@@ -5851,11 +6038,9 @@ static void uncharge_list(struct list_head *page_list)
 		page = list_entry(next, struct page, lru);
 		next = page->lru.next;
 
-		/* 主要将要回收的资源 复值给ug，然后将page 和 memcg 解除关系 */
 		uncharge_page(page, &ug);
 	} while (next != page_list);
 
-	/* 真正释放资源，cg资源统计，改变page_counter */
 	if (ug.memcg)
 		uncharge_batch(&ug);
 }
@@ -5911,6 +6096,7 @@ void mem_cgroup_uncharge_list(struct list_head *page_list)
  */
 void mem_cgroup_migrate(struct page *oldpage, struct page *newpage)
 {
+	printk(KERN_ALERT "%s %s %d, replacing is called!!!", __func__, __FILE__, __LINE__);
 	struct mem_cgroup *memcg;
 	unsigned int nr_pages;
 	bool compound;
@@ -5937,6 +6123,11 @@ void mem_cgroup_migrate(struct page *oldpage, struct page *newpage)
 	/* Force-charge the new page. The old one will be freed soon */
 	compound = PageTransHuge(newpage);
 	nr_pages = compound ? hpage_nr_pages(newpage) : 1;
+
+	/* 如果新页面属于 pagecache */
+	if(newpage->mapping && (((unsigned long)(newpage->mapping) & 0x1) == 0)){
+		page_counter_charge(&memcg->pagecache, nr_pages);
+	}
 
 	page_counter_charge(&memcg->memory, nr_pages);
 	if (do_memsw_account())
@@ -6176,7 +6367,7 @@ void mem_cgroup_swapout(struct page *page, swp_entry_t entry)
 	 * only synchronisation we have for udpating the per-CPU variables.
 	 */
 	VM_BUG_ON(!irqs_disabled());
-	(memcg, page, PageTransHuge(page),
+	mem_cgroup_charge_statistics(memcg, page, PageTransHuge(page),
 				     -nr_entries);
 	memcg_check_events(memcg, page);
 

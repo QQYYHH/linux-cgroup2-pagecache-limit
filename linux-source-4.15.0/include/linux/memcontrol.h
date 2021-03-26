@@ -182,6 +182,8 @@ struct mem_cgroup {
 	/* Accounted resources */
 	struct page_counter memory;
 	struct page_counter swap;
+	/* added to control pagecache */
+	struct page_counter pagecache;
 
 	/* Legacy consumer-oriented counters */
 	struct page_counter memsw;
