@@ -13,7 +13,7 @@ If you use other versions of linux, please replace these files.
 ## how to use
 You can install the new kernel following the instructions below:
 ```bash
-# click Kernel hacking -> Complie-time checks -> conpile the kernel with debug info
+# click Kernel hacking -> Complie-time checks -> compile the kernel with debug info
 # generate drarf4 debuginfo
 # provide GDB scripts for kernel debugging
 make menuconfig
