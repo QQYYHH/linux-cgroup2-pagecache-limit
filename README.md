@@ -13,7 +13,7 @@ If you use other versions of linux, please replace these files.
 ## how to use
 You can install the new kernel following the instructions below:
 ```bash
-# click Kernel hacking -> Complie-time checks -> conpile the kernel with debug info
+# click Kernel hacking -> Complie-time checks -> compile the kernel with debug info
 # generate drarf4 debuginfo
 # provide GDB scripts for kernel debugging
 make menuconfig
@@ -24,7 +24,7 @@ make modules_install
 Then you can boot the new kernel through GRUB. Before you boot the new kernel, you shold firstly disable the cgroup-v1 to allow cgroup-v2 using all sub-system:
 ```bash
 vim /etc/default/grub
-# append cgroup_no_v1=all to GRUB_CMDLINE_LINUX
+# append systemd.unified_cgroup_hierarchy=1 to GRUB_CMDLINE_LINUX
 update-grup
 ```
 After you boot the new kernel:
