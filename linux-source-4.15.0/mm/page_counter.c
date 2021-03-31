@@ -23,6 +23,10 @@ void page_counter_cancel(struct page_counter *counter, unsigned long nr_pages)
 	long new;
 
 	new = atomic_long_sub_return(nr_pages, &counter->count);
+	/* avoid subtracting to negative number */
+	if(new < 0)
+		atomic_long_set(&counter->count, 0);
+
 	/* More uncharges than charges? */
 	WARN_ON_ONCE(new < 0);
 }

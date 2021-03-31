@@ -2111,7 +2111,7 @@ retry_pagecache:
 		}
 	}
 	/* 整体回收完毕之后，判断pagecache是否满足条件，如果依旧不满足，再次回收 */
-	int res_pagecache = 0; // 便于记录 pagecache的可用余量
+	unsigned int res_pagecache = 0; // 便于记录 pagecache的可用余量
 	if(pagecache_overflow == 1 && (res_pagecache = pagecache_cgroup_margin(pagecache_over_limit)) < nr_pages){
 
 		printk(KERN_ALERT "%s %s %d, ###count: %d, limit: %d", __func__, __FILE__, __LINE__, page_counter_read(&pagecache_over_limit->pagecache), READ_ONCE(pagecache_over_limit->pagecache.limit));
