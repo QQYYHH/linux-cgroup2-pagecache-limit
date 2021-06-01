@@ -5,7 +5,9 @@ Our linux version is 4.15.0 and the directory **linux-source-4.15.0** is the cor
 ## modified files
 To implement the new pagecache-limit mechanic, I modified the following files.
 - include/linux/memcontrol.h
+- include/linux/page_count.h
 - mm/filemap.c
+- mm/page_count
 - mm/memcontrol.c
 - mm/vmscan.c
 If you use other versions of linux, please replace these files.
